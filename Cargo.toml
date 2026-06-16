@@ -1,0 +1,29 @@
+[package]
+name = "webmcp"
+version = "1.0.0"
+edition = "2021"
+description = "Search MCP server with multiple search engines and deep search, driven by the Obscura browser engine"
+license = "GPL-3.0"
+repository = "https://github.com/lijunjie2232/webmcp"
+
+[[bin]]
+name = "webmcp"
+path = "src/main.rs"
+
+[features]
+default = []
+# Anti-bot fingerprinting. Off by default because it pulls wreq/BoringSSL.
+stealth = ["obscura/stealth"]
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+futures = "0.3"
+# Obscura is not on crates.io; pin the commit this port was developed against.
+obscura = { git = "https://github.com/h4ckf0r0day/obscura", rev = "8a8a53f0cf129031f9546eab2b40810c30e9b9ef" }
+pdf-extract = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+time = { version = "0.3", features = ["formatting"] }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time", "io-std", "io-util"] }
+url = "2"
