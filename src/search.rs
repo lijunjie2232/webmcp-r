@@ -1,7 +1,9 @@
 //! Multi-engine search: builds the SERP URL, runs the engine-specific
 //! extraction script inside Obscura, then normalises redirect wrappers.
 
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
@@ -9,12 +11,14 @@ use base64::Engine as _;
 use futures::future::join_all;
 use serde::Serialize;
 use serde_json::{json, Value};
+use tokio::time::Instant;
 use url::Url;
 
 use crate::browser::{now_iso, BrowserManager};
 
+pub const DEFAULT_SEARCH_MAX_RESULTS: usize = 20;
 const SEARCH_SETTLE_MS: u64 = 500;
-const SEARCH_TIMEOUT_MS: u64 = 12_000;
+const SEARCH_TIMEOUT_MS: u64 = 20_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Engine {
@@ -123,21 +127,89 @@ impl SearchManager {
         Self { browser }
     }
 
-    pub async fn search(&self, keyword: &str, engine_name: &str) -> Result<SearchResponse> {
-        self.search_with_timeout(keyword, engine_name, SEARCH_TIMEOUT_MS)
+    pub async fn search(
+        &self,
+        keyword: &str,
+        engine_name: &str,
+        max_results: Option<usize>,
+    ) -> Result<SearchResponse> {
+        let max = max_results.filter(|&n| n > 0).unwrap_or(DEFAULT_SEARCH_MAX_RESULTS);
+        self.search_with_options(keyword, engine_name, SEARCH_TIMEOUT_MS, max)
             .await
     }
 
-    pub async fn search_with_timeout(
+    pub async fn search_with_options(
         &self,
         keyword: &str,
         engine_name: &str,
         timeout_ms: u64,
+        max_results: usize,
     ) -> Result<SearchResponse> {
         let engine = Engine::parse(engine_name)?;
-        let url = build_url(engine, keyword, &self.browser.locale());
-        log(&format!("Searching {} for \"{}\"", engine.name(), keyword));
+        let locale = self.browser.locale();
+        let max_results = max_results.max(1);
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
 
+        log(&format!(
+            "Searching {} for \"{}\" (max_results={})",
+            engine.name(),
+            keyword,
+            max_results
+        ));
+
+        let mut combined = self
+            .fetch_page_hits(engine, keyword, &locale, max_results, 1, timeout_ms)
+            .await?;
+
+        // Yahoo Japan renders ~10 organic results per page; paginate when more are requested.
+        if engine == Engine::YahooJapan && max_results > 10 && combined.len() < max_results {
+            let max_pages = max_results.div_ceil(10).min(3);
+            for page_idx in 1..max_pages {
+                let remaining_ms = deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis() as u64;
+                if remaining_ms < 2_500 || combined.len() >= max_results {
+                    break;
+                }
+                let start = page_idx * 10 + 1;
+                match self
+                    .fetch_page_hits(engine, keyword, &locale, max_results, start, remaining_ms)
+                    .await
+                {
+                    Ok(next_hits) if !next_hits.is_empty() => combined.extend(next_hits),
+                    Ok(_) => break,
+                    Err(err) => {
+                        log(&format!(
+                            "YahooJapan pagination page {} failed: {err}",
+                            page_idx + 1
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
+
+        let mut deduped = dedupe_hits(combined);
+        deduped.truncate(max_results);
+
+        Ok(SearchResponse {
+            engine: engine.name().to_string(),
+            keyword: keyword.to_string(),
+            results: deduped,
+            timestamp: now_iso(),
+        })
+    }
+
+    async fn fetch_page_hits(
+        &self,
+        engine: Engine,
+        keyword: &str,
+        locale: &str,
+        max_results: usize,
+        start: usize,
+        timeout_ms: u64,
+    ) -> Result<Vec<SearchHit>> {
+        let url = build_url(engine, keyword, locale, max_results, start);
         let value = self
             .browser
             .evaluate_page(&url, engine.extract_js(), timeout_ms, SEARCH_SETTLE_MS)
@@ -155,20 +227,20 @@ impl SearchManager {
                 results.len()
             ));
         }
-        Ok(SearchResponse {
-            engine: engine.name().to_string(),
-            keyword: keyword.to_string(),
-            results,
-            timestamp: now_iso(),
-        })
+        Ok(results)
     }
 
     /// Run several engines concurrently. Failed engines are reported per key,
     /// matching the original `search_multiple` shape.
-    pub async fn search_multiple(&self, keyword: &str, engines: &[String]) -> Value {
+    pub async fn search_multiple(
+        &self,
+        keyword: &str,
+        engines: &[String],
+        max_results: Option<usize>,
+    ) -> Value {
         let futures = engines
             .iter()
-            .map(|engine| async move { (engine.clone(), self.search(keyword, engine).await) });
+            .map(|engine| async move { (engine.clone(), self.search(keyword, engine, max_results).await) });
 
         let mut out = serde_json::Map::new();
         for (engine, result) in join_all(futures).await {
@@ -253,7 +325,7 @@ fn ddg_region_code(locale: &str) -> Option<&'static str> {
     }
 }
 
-fn build_url(engine: Engine, keyword: &str, locale: &str) -> String {
+fn build_url(engine: Engine, keyword: &str, locale: &str, max_results: usize, start: usize) -> String {
     let mut url = Url::parse(engine.base_url()).expect("static search engine URL");
     {
         let mut pairs = url.query_pairs_mut();
@@ -261,8 +333,34 @@ fn build_url(engine: Engine, keyword: &str, locale: &str) -> String {
         for (key, value) in engine.locale_params(locale) {
             pairs.append_pair(key, &value);
         }
+        match engine {
+            Engine::Google if max_results > 10 => {
+                pairs.append_pair("num", &max_results.min(30).to_string());
+            }
+            Engine::Bing if max_results > 10 => {
+                pairs.append_pair("count", &max_results.min(30).to_string());
+            }
+            Engine::YahooJapan if start > 1 => {
+                pairs.append_pair("ei", "UTF-8");
+                pairs.append_pair("x", "nl");
+                pairs.append_pair("b", &start.to_string());
+            }
+            _ => {}
+        }
     }
     url.to_string()
+}
+
+fn dedupe_hits(hits: Vec<SearchHit>) -> Vec<SearchHit> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(hits.len());
+    for hit in hits {
+        let key = hit.url.trim_end_matches('/').to_string();
+        if seen.insert(key) {
+            out.push(hit);
+        }
+    }
+    out
 }
 
 fn parse_hits(value: &Value) -> Vec<SearchHit> {
@@ -513,7 +611,7 @@ const GOOGLE_JS: &str = r#"(() => {
     }
     out.push({ title: title.substring(0, 200), url: href, snippet });
   });
-  return out.slice(0, 10);
+  return out.slice(0, 30);
 })()"#;
 
 const BING_JS: &str = r#"(() => {
@@ -559,7 +657,7 @@ const BING_JS: &str = r#"(() => {
       out.push({ title: title.substring(0, 200), url: href, snippet: extractSnippet(container, title) });
     });
   }
-  return out.slice(0, 10);
+  return out.slice(0, 30);
 })()"#;
 
 const DUCKDUCKGO_JS: &str = r#"(() => {
@@ -589,7 +687,7 @@ const DUCKDUCKGO_JS: &str = r#"(() => {
       snippet: snippetEl ? (snippetEl.textContent || '').replace(/\s+/g, ' ').trim().substring(0, 350) : ''
     });
   });
-  return out.slice(0, 10);
+  return out.slice(0, 30);
 })()"#;
 
 const YAHOO_JP_JS: &str = r#"(() => {
@@ -653,7 +751,7 @@ const YAHOO_JP_JS: &str = r#"(() => {
       out.push({ title: title.substring(0, 200), url: href, snippet });
     });
   }
-  return out.slice(0, 10);
+  return out.slice(0, 30);
 })()"#;
 
 #[cfg(test)]
@@ -663,20 +761,32 @@ mod tests {
     #[test]
     fn builds_language_aware_urls() {
         assert_eq!(
-            build_url(Engine::Google, "rust 検索", "ja-JP"),
+            build_url(Engine::Google, "rust 検索", "ja-JP", 10, 1),
             "https://www.google.com/search?q=rust+%E6%A4%9C%E7%B4%A2&hl=ja&gl=jp"
         );
         assert_eq!(
-            build_url(Engine::Bing, "rust", "ja-JP"),
+            build_url(Engine::Google, "rust", "ja-JP", 20, 1),
+            "https://www.google.com/search?q=rust&hl=ja&gl=jp&num=20"
+        );
+        assert_eq!(
+            build_url(Engine::Bing, "rust", "ja-JP", 10, 1),
             "https://www.bing.com/search?q=rust&setlang=ja&cc=JP"
         );
         assert_eq!(
-            build_url(Engine::DuckDuckGo, "rust", "ja-JP"),
+            build_url(Engine::Bing, "rust", "ja-JP", 20, 1),
+            "https://www.bing.com/search?q=rust&setlang=ja&cc=JP&count=20"
+        );
+        assert_eq!(
+            build_url(Engine::DuckDuckGo, "rust", "ja-JP", 20, 1),
             "https://duckduckgo.com/html/?q=rust&kl=jp-jp"
         );
         assert_eq!(
-            build_url(Engine::YahooJapan, "x", "ja-JP"),
+            build_url(Engine::YahooJapan, "x", "ja-JP", 20, 1),
             "https://search.yahoo.co.jp/search?p=x"
+        );
+        assert_eq!(
+            build_url(Engine::YahooJapan, "x", "ja-JP", 20, 11),
+            "https://search.yahoo.co.jp/search?p=x&ei=UTF-8&x=nl&b=11"
         );
     }
 

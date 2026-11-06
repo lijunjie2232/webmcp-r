@@ -41,9 +41,10 @@ async fn run() -> Result<()> {
                 .cloned()
                 .unwrap_or_else(|| "yahoojapan".to_string());
             let language = flag(&args, "--language").unwrap_or(locale);
+            let max_results = flag(&args, "--max-results").and_then(|value| value.parse().ok());
 
             let server = SearchServer::new(&language, default_engines(), 5, 5)?;
-            let response = server.manager.search(keyword, &engine).await?;
+            let response = server.manager.search(keyword, &engine, max_results).await?;
             println!("{}", serde_json::to_string_pretty(&response)?);
             Ok(())
         }

@@ -148,7 +148,7 @@ impl DeepSearch {
             (
                 engine.clone(),
                 search
-                    .search_with_timeout(keyword, engine, search_timeout_ms)
+                    .search_with_options(keyword, engine, search_timeout_ms, max)
                     .await,
             )
         });

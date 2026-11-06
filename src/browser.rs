@@ -17,6 +17,48 @@ pub fn now_iso() -> String {
     OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_default()
 }
 
+const DEFAULT_LOCALE: &str = "ja-JP";
+
+/// Normalize locale strings to a full BCP-47 `lang-REGION` tag (e.g. `"ja"` -> `"ja-JP"`).
+pub fn normalize_locale(locale: &str) -> String {
+    let cleaned = locale.trim().replace('_', "-");
+    if cleaned.is_empty() {
+        return DEFAULT_LOCALE.to_string();
+    }
+
+    match cleaned.to_ascii_lowercase().as_str() {
+        "ja" | "jp" => return "ja-JP".to_string(),
+        "en" => return "en-US".to_string(),
+        "zh" | "zh-hans" => return "zh-CN".to_string(),
+        "zh-hant" => return "zh-TW".to_string(),
+        "ko" => return "ko-KR".to_string(),
+        "de" => return "de-DE".to_string(),
+        "fr" => return "fr-FR".to_string(),
+        "es" => return "es-ES".to_string(),
+        "it" => return "it-IT".to_string(),
+        "pt" => return "pt-BR".to_string(),
+        "ru" => return "ru-RU".to_string(),
+        "ar" => return "ar-SA".to_string(),
+        "hi" => return "hi-IN".to_string(),
+        _ => {}
+    }
+
+    let parts: Vec<&str> = cleaned.split('-').filter(|p| !p.is_empty()).collect();
+    if parts.len() >= 2 {
+        let lang = parts[0].to_ascii_lowercase();
+        let region = parts[parts.len() - 1].to_ascii_uppercase();
+        if (2..=3).contains(&lang.len())
+            && lang.chars().all(|c| c.is_ascii_lowercase())
+            && region.len() == 2
+            && region.chars().all(|c| c.is_ascii_uppercase())
+        {
+            return format!("{lang}-{region}");
+        }
+    }
+
+    DEFAULT_LOCALE.to_string()
+}
+
 /// Readable text extraction evaluated inside the page.
 ///
 /// Obscura's `innerText` folds `<style>` contents into the result and does not
@@ -176,7 +218,7 @@ impl BrowserManager {
 
         Ok(Self {
             tx,
-            locale: Mutex::new(locale.to_string()),
+            locale: Mutex::new(normalize_locale(locale)),
         })
     }
 
@@ -184,8 +226,10 @@ impl BrowserManager {
         self.locale.lock().unwrap().clone()
     }
 
-    pub fn set_locale(&self, locale: &str) {
-        *self.locale.lock().unwrap() = locale.to_string();
+    pub fn set_locale(&self, locale: &str) -> String {
+        let normalized = normalize_locale(locale);
+        *self.locale.lock().unwrap() = normalized.clone();
+        normalized
     }
 
     /// Best-effort `navigator.language` override. Obscura's high-level API has
@@ -506,7 +550,7 @@ fn pdf_text(bytes: &[u8]) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::truncate;
+    use super::{normalize_locale, truncate};
 
     #[test]
     fn truncates_at_char_boundary() {
@@ -514,5 +558,14 @@ mod tests {
         assert!(out.starts_with("日本語"));
         assert!(out.ends_with("[Content truncated due to length]"));
         assert_eq!(truncate("short".to_string(), 10), "short");
+    }
+
+    #[test]
+    fn normalizes_short_locales() {
+        assert_eq!(normalize_locale("ja"), "ja-JP");
+        assert_eq!(normalize_locale("en"), "en-US");
+        assert_eq!(normalize_locale("zh_CN"), "zh-CN");
+        assert_eq!(normalize_locale("ja-JP"), "ja-JP");
+        assert_eq!(normalize_locale(""), "ja-JP");
     }
 }

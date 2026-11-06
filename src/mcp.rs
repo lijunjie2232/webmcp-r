@@ -38,12 +38,12 @@ impl SearchServer {
     }
 
     pub fn set_language(&self, language: &str) -> Value {
-        self.browser.set_locale(language);
-        log(&format!("Language set to {language}"));
+        let normalized = self.browser.set_locale(language);
+        log(&format!("Language set to {normalized}"));
         json!({
             "success": true,
-            "language": language,
-            "message": format!("Language set to {language}"),
+            "language": normalized,
+            "message": format!("Language set to {normalized}"),
         })
     }
 
@@ -61,16 +61,18 @@ impl SearchServer {
             "search" => {
                 let keyword = keyword.ok_or_else(|| anyhow!("Missing query parameter"))?;
                 let engine = string_arg(args, "engine").unwrap_or_else(|| "yahoojapan".into());
+                let max_results = usize_arg(args, "maxResults").or_else(|| usize_arg(args, "max_results"));
                 log(&format!("Calling search with args: {args}"));
-                let response = self.manager.search(keyword, &engine).await?;
+                let response = self.manager.search(keyword, &engine, max_results).await?;
                 Ok(serde_json::to_value(response)?)
             }
             "search_multiple" => {
                 let keyword = keyword.ok_or_else(|| anyhow!("Missing query parameter"))?;
                 let engines = string_list_arg(args, "engines")
                     .ok_or_else(|| anyhow!("Missing or invalid engines parameter"))?;
+                let max_results = usize_arg(args, "maxResults").or_else(|| usize_arg(args, "max_results"));
                 log(&format!("Calling search_multiple with args: {args}"));
-                Ok(self.manager.search_multiple(keyword, &engines).await)
+                Ok(self.manager.search_multiple(keyword, &engines, max_results).await)
             }
             "deep_search" => {
                 let keyword = keyword.ok_or_else(|| anyhow!("Missing query parameter"))?;
@@ -253,7 +255,7 @@ fn tools() -> Value {
     json!([
         {
             "name": "search",
-            "description": "ウェブ検索を実行し、検索結果を取得します。",
+            "description": "指定された検索エンジンを使用してウェブ検索を行い、複数件の候補（タイトル・URL・スニペット）を取得します。取得した候補から適切なページを選び、webmcp_parse_url で本文・コンテキストを取得してください。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -263,6 +265,11 @@ fn tools() -> Value {
                         "enum": ["google", "bing", "duckduckgo", "yahoojapan"],
                         "description": "検索エンジン（デフォルト: yahoojapan）",
                         "default": "yahoojapan"
+                    },
+                    "maxResults": {
+                        "type": "integer",
+                        "description": "取得する最大結果数（デフォルト: 20）",
+                        "default": 20
                     },
                     "language": {
                         "type": "string",
@@ -284,6 +291,11 @@ fn tools() -> Value {
                         "type": "array",
                         "items": { "type": "string", "enum": ["google", "bing", "duckduckgo", "yahoojapan"] },
                         "description": "検索エンジンのリスト"
+                    },
+                    "maxResults": {
+                        "type": "integer",
+                        "description": "各エンジンから取得する最大結果数（デフォルト: 20）",
+                        "default": 20
                     },
                     "language": {
                         "type": "string",
